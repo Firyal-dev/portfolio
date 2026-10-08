@@ -3,8 +3,6 @@ import "./globals.css";
 import { Roboto, Inter } from "next/font/google";
 import { ThemeProvider } from "@/components/providers/theme";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import Footer from "@/partials/footer";
-import Nav from "@/partials/nav";
 
 const roboto = Roboto({
   variable: "--font-roboto",
@@ -92,11 +90,7 @@ export default function RootLayout({
           enableSystem
           disableTransitionOnChange
         >
-          <TooltipProvider>
-            <Nav />
-            <main>{children}</main>
-            <Footer />
-          </TooltipProvider>
+          <TooltipProvider>{children}</TooltipProvider>
         </ThemeProvider>
       </body>
     </html>

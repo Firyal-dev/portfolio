@@ -7,5 +7,6 @@ run npm run build
 
 from nginx:alpine
 copy --from=builder /app/out /usr/share/nginx/html
+copy nginx.conf /etc/nginx/conf.d/default.conf
 expose 80
 cmd ["nginx", "-g", "daemon off;"]

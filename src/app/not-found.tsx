@@ -5,51 +5,108 @@ import {
     useEffect,
     useRef,
     useCallback,
-    startTransition,
     type CSSProperties,
 } from "react";
+import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/components/lib/utils";
 
-interface Entity {
+const CANVAS_WIDTH = 800;
+const CANVAS_HEIGHT = 600;
+const PIXEL_SIZE = 4;
+/** Speeds are expressed per 60fps frame; dt scales them so the game runs at the
+ *  same pace on a 120Hz display. */
+const FRAME_MS = 1000 / 60;
+const BULLET_COOLDOWN_MS = 200;
+const ENEMY_SPAWN_COOLDOWN_MS = 1000;
+
+interface Box {
     x: number;
     y: number;
     width: number;
     height: number;
+}
+
+interface Entity extends Box {
     speed: number;
     active: boolean;
 }
 
-interface Player extends Entity { }
-
-interface Bullet extends Entity { }
-
 interface EnemyEntity extends Entity {
     type: number;
+}
+
+interface Player {
+    x: number;
+    y: number;
+    speed: number;
 }
 
 interface Explosion {
     x: number;
     y: number;
     frame: number;
-    active: boolean;
 }
 
 interface GameState {
     player: Player;
-    bullets: Bullet[];
-    enemyBullets: Bullet[];
+    bullets: Entity[];
+    enemyBullets: Entity[];
     enemies: EnemyEntity[];
     explosions: Explosion[];
-    lastEnemySpawn: number;
-    lastBulletFire: number;
+    elapsed: number;
+    nextBulletFire: number;
+    nextEnemySpawn: number;
     gameOver: boolean;
 }
 
-interface TouchPosition {
-    x: number;
-    y: number;
+const createState = (): GameState => ({
+    player: { x: 400, y: 500, speed: 5 },
+    bullets: [],
+    enemyBullets: [],
+    enemies: [],
+    explosions: [],
+    elapsed: 0,
+    nextBulletFire: BULLET_COOLDOWN_MS,
+    nextEnemySpawn: ENEMY_SPAWN_COOLDOWN_MS,
+    gameOver: false,
+});
+
+const ARROW_KEYS = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"] as const;
+type ArrowKey = (typeof ARROW_KEYS)[number];
+
+const overlaps = (a: Box, b: Box) =>
+    a.x < b.x + b.width &&
+    a.x + a.width > b.x &&
+    a.y < b.y + b.height &&
+    a.y + a.height > b.y;
+
+function spawnEnemy(size: number): EnemyEntity {
+    return {
+        x: Math.random() * (CANVAS_WIDTH - size),
+        y: -size,
+        width: size,
+        height: size,
+        speed: 2 + Math.random() * 3,
+        active: true,
+        type: Math.floor(Math.random() * 2),
+    };
 }
+
+function getDirectionFromTouch(touchX: number, touchY: number, rect: DOMRect): ArrowKey {
+    const centerX = rect.width / 2;
+    const centerY = rect.height / 2;
+    const horizontalDistance = Math.abs(touchX - centerX);
+    const verticalDistance = Math.abs(touchY - centerY);
+    if (horizontalDistance > verticalDistance) {
+        return touchX < centerX ? "ArrowLeft" : "ArrowRight";
+    }
+    return touchY < centerY ? "ArrowUp" : "ArrowDown";
+}
+
+const clearKeys = (keys: Set<string>) => {
+    for (const key of ARROW_KEYS) keys.delete(key);
+};
 
 export interface SpaceShooterProps {
     backgroundColor?: string;
@@ -69,9 +126,6 @@ export interface SpaceShooterProps {
     className?: string;
 }
 
-const ARROW_KEYS = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"] as const;
-type ArrowKey = (typeof ARROW_KEYS)[number];
-
 export default function SpaceShooter({
     backgroundColor = "#000011",
     playerColor = "#00FF00",
@@ -90,36 +144,23 @@ export default function SpaceShooter({
     className,
 }: SpaceShooterProps) {
     const canvasRef = useRef<HTMLCanvasElement>(null);
-    const gameLoopRef = useRef<number | null>(null);
     const keysRef = useRef<Set<string>>(new Set());
-    const touchRef = useRef<TouchPosition | null>(null);
+    /** The simulation runs at 60fps, so it lives in a ref: React state would
+     *  re-render the whole component every frame. Only score/gameOver — the two
+     *  things the DOM actually shows — are React state. */
+    const stateRef = useRef<GameState>(createState());
 
     const [score, setScore] = useState(0);
-    const [gameState, setGameState] = useState<GameState>({
-        player: { x: 400, y: 500, width: playerSize, height: playerSize, speed: 5, active: true },
-        bullets: [],
-        enemyBullets: [],
-        enemies: [],
-        explosions: [],
-        lastEnemySpawn: 0,
-        lastBulletFire: 0,
-        gameOver: false,
-    });
-
-    const CANVAS_WIDTH = 800;
-    const CANVAS_HEIGHT = 600;
-    const PIXEL_SIZE = 4;
+    const [gameOver, setGameOver] = useState(false);
 
     const drawPixelRect = useCallback(
         (ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, color: string) => {
             ctx.fillStyle = color;
-            const pixelWidth = Math.floor(width / PIXEL_SIZE) * PIXEL_SIZE;
-            const pixelHeight = Math.floor(height / PIXEL_SIZE) * PIXEL_SIZE;
             ctx.fillRect(
                 Math.floor(x / PIXEL_SIZE) * PIXEL_SIZE,
                 Math.floor(y / PIXEL_SIZE) * PIXEL_SIZE,
-                pixelWidth,
-                pixelHeight
+                Math.floor(width / PIXEL_SIZE) * PIXEL_SIZE,
+                Math.floor(height / PIXEL_SIZE) * PIXEL_SIZE
             );
         },
         []
@@ -129,7 +170,7 @@ export default function SpaceShooter({
         (ctx: CanvasRenderingContext2D, player: Player) => {
             const x = Math.floor(player.x / PIXEL_SIZE) * PIXEL_SIZE;
             const y = Math.floor(player.y / PIXEL_SIZE) * PIXEL_SIZE;
-            const scale = player.width / 32;
+            const scale = playerSize / 32;
             ctx.fillStyle = playerColor;
             ctx.fillRect(x + 12 * scale, y, 8 * scale, 24 * scale);
             ctx.fillRect(x, y + 16 * scale, 32 * scale, 8 * scale);
@@ -137,18 +178,18 @@ export default function SpaceShooter({
             ctx.fillRect(x + 4 * scale, y + 24 * scale, 8 * scale, 8 * scale);
             ctx.fillRect(x + 20 * scale, y + 24 * scale, 8 * scale, 8 * scale);
         },
-        [playerColor]
+        [playerColor, playerSize]
     );
 
     const drawBullet = useCallback(
-        (ctx: CanvasRenderingContext2D, bullet: Bullet) => {
+        (ctx: CanvasRenderingContext2D, bullet: Entity) => {
             drawPixelRect(ctx, bullet.x, bullet.y, bullet.width, bullet.height, bulletColor);
         },
         [bulletColor, drawPixelRect]
     );
 
     const drawEnemyBullet = useCallback(
-        (ctx: CanvasRenderingContext2D, bullet: Bullet) => {
+        (ctx: CanvasRenderingContext2D, bullet: Entity) => {
             drawPixelRect(ctx, bullet.x, bullet.y, bullet.width, bullet.height, enemyBulletColor);
         },
         [enemyBulletColor, drawPixelRect]
@@ -186,191 +227,98 @@ export default function SpaceShooter({
         [explosionColor]
     );
 
-    const checkCollision = useCallback((obj1: Entity, obj2: Entity) => {
-        return (
-            obj1.x < obj2.x + obj2.width &&
-            obj1.x + obj1.width > obj2.x &&
-            obj1.y < obj2.y + obj2.height &&
-            obj1.y + obj1.height > obj2.y
-        );
-    }, []);
+    const update = useCallback((dt: number) => {
+        const s = stateRef.current;
+        const p = s.player;
 
-    const spawnEnemy = useCallback((): EnemyEntity => {
-        return {
-            x: Math.random() * (CANVAS_WIDTH - enemySize),
-            y: -enemySize,
-            width: enemySize,
-            height: enemySize,
-            speed: 2 + Math.random() * 3,
-            active: true,
-            type: Math.floor(Math.random() * 2),
-        };
-    }, [enemySize]);
-
-    const fireBullet = useCallback(
-        (player: Player): Bullet => ({
-            x: player.x + player.width / 2 - 2,
-            y: player.y,
-            width: 4,
-            height: 12,
-            speed: 8,
-            active: true,
-        }),
-        []
-    );
-
-    const fireEnemyBullet = useCallback(
-        (enemy: EnemyEntity): Bullet => ({
-            x: enemy.x + enemy.width / 2 - 2,
-            y: enemy.y + enemy.height,
-            width: 4,
-            height: 8,
-            speed: 4,
-            active: true,
-        }),
-        []
-    );
-
-    const resetGame = useCallback(() => {
-        setScore(0);
-        setGameState({
-            player: { x: 400, y: 500, width: playerSize, height: playerSize, speed: 5, active: true },
-            bullets: [],
-            enemyBullets: [],
-            enemies: [],
-            explosions: [],
-            lastEnemySpawn: 0,
-            lastBulletFire: 0,
-            gameOver: false,
+        // Explosions keep animating after death, so this runs before the gameOver bail-out.
+        s.explosions = s.explosions.filter((explosion) => {
+            explosion.frame++;
+            return explosion.frame < 10;
         });
-    }, [playerSize]);
+        if (s.gameOver) return;
 
-    const updateGame = useCallback(() => {
-        setGameState((prevState) => {
-            if (prevState.gameOver) return prevState;
-            const newState: GameState = { ...prevState, player: { ...prevState.player } };
-            const currentTime = Date.now();
+        s.elapsed += dt * FRAME_MS;
 
-            if (keysRef.current.has("ArrowLeft") && newState.player.x > 0) {
-                newState.player.x -= newState.player.speed * gameSpeed;
-            }
-            if (keysRef.current.has("ArrowRight") && newState.player.x < CANVAS_WIDTH - newState.player.width) {
-                newState.player.x += newState.player.speed * gameSpeed;
-            }
-            if (keysRef.current.has("ArrowUp") && newState.player.y > 0) {
-                newState.player.y -= newState.player.speed * gameSpeed;
-            }
-            if (keysRef.current.has("ArrowDown") && newState.player.y < CANVAS_HEIGHT - newState.player.height) {
-                newState.player.y += newState.player.speed * gameSpeed;
-            }
+        if (keysRef.current.has("ArrowLeft") && p.x > 0) p.x -= p.speed * gameSpeed * dt;
+        if (keysRef.current.has("ArrowRight") && p.x < CANVAS_WIDTH - playerSize) p.x += p.speed * gameSpeed * dt;
+        if (keysRef.current.has("ArrowUp") && p.y > 0) p.y -= p.speed * gameSpeed * dt;
+        if (keysRef.current.has("ArrowDown") && p.y < CANVAS_HEIGHT - playerSize) p.y += p.speed * gameSpeed * dt;
 
-            if (touchRef.current) {
-                const targetX = touchRef.current.x - newState.player.width / 2;
-                const targetY = touchRef.current.y - newState.player.height / 2;
-                const dx = targetX - newState.player.x;
-                const dy = targetY - newState.player.y;
-                const distance = Math.sqrt(dx * dx + dy * dy);
-                if (distance > 5) {
-                    newState.player.x += (dx / distance) * newState.player.speed * gameSpeed;
-                    newState.player.y += (dy / distance) * newState.player.speed * gameSpeed;
-                }
-                newState.player.x = Math.max(0, Math.min(CANVAS_WIDTH - newState.player.width, newState.player.x));
-                newState.player.y = Math.max(0, Math.min(CANVAS_HEIGHT - newState.player.height, newState.player.y));
-            }
-
-            if (currentTime - newState.lastBulletFire > 200) {
-                newState.bullets = [...newState.bullets, fireBullet(newState.player)];
-                newState.lastBulletFire = currentTime;
-            }
-
-            newState.bullets = newState.bullets.filter((bullet) => {
-                bullet.y -= bullet.speed * gameSpeed;
-                return bullet.y > -bullet.height && bullet.active;
+        if (s.elapsed >= s.nextBulletFire) {
+            s.bullets.push({
+                x: p.x + playerSize / 2 - 2,
+                y: p.y,
+                width: 4,
+                height: 12,
+                speed: 8,
+                active: true,
             });
+            s.nextBulletFire = s.elapsed + BULLET_COOLDOWN_MS;
+        }
 
-            newState.enemyBullets = newState.enemyBullets.filter((bullet) => {
-                bullet.y += bullet.speed * gameSpeed;
-                return bullet.y < CANVAS_HEIGHT + bullet.height && bullet.active;
-            });
+        if (s.elapsed >= s.nextEnemySpawn) {
+            s.enemies.push(spawnEnemy(enemySize));
+            s.nextEnemySpawn = s.elapsed + ENEMY_SPAWN_COOLDOWN_MS;
+        }
 
-            if (currentTime - newState.lastEnemySpawn > 1000) {
-                newState.enemies = [...newState.enemies, spawnEnemy()];
-                newState.lastEnemySpawn = currentTime;
-            }
-
-            newState.enemies = newState.enemies.filter((enemy) => {
-                enemy.y += enemy.speed * gameSpeed;
-                if (Math.random() < 0.005 * gameSpeed) {
-                    newState.enemyBullets.push(fireEnemyBullet(enemy));
-                }
-                return enemy.y < CANVAS_HEIGHT + enemy.height && enemy.active;
-            });
-
-            newState.bullets.forEach((bullet) => {
-                newState.enemies.forEach((enemy) => {
-                    if (bullet.active && enemy.active && checkCollision(bullet, enemy)) {
-                        bullet.active = false;
-                        enemy.active = false;
-                        newState.explosions.push({
-                            x: enemy.x + enemy.width / 2,
-                            y: enemy.y + enemy.height / 2,
-                            frame: 0,
-                            active: true,
-                        });
-                        startTransition(() => setScore((prev) => prev + (enemy.type + 1) * 10));
-                    }
+        for (const bullet of s.bullets) bullet.y -= bullet.speed * gameSpeed * dt;
+        for (const bullet of s.enemyBullets) bullet.y += bullet.speed * gameSpeed * dt;
+        for (const enemy of s.enemies) {
+            enemy.y += enemy.speed * gameSpeed * dt;
+            // ponytail: fixed 0.5% chance per enemy per frame. Raise it (or make it
+            // difficulty-scaled) once it feels too sparse — dt keeps it frame-rate independent.
+            if (Math.random() < 0.005 * gameSpeed * dt) {
+                s.enemyBullets.push({
+                    x: enemy.x + enemy.width / 2 - 2,
+                    y: enemy.y + enemy.height,
+                    width: 4,
+                    height: 8,
+                    speed: 4,
+                    active: true,
                 });
+            }
+        }
+
+        s.bullets = s.bullets.filter((bullet) => bullet.y > -bullet.height && bullet.active);
+        s.enemyBullets = s.enemyBullets.filter((bullet) => bullet.y < CANVAS_HEIGHT + bullet.height && bullet.active);
+        s.enemies = s.enemies.filter((enemy) => enemy.y < CANVAS_HEIGHT + enemy.height && enemy.active);
+
+        for (const bullet of s.bullets) {
+            if (!bullet.active) continue;
+            for (const enemy of s.enemies) {
+                if (!enemy.active || !overlaps(bullet, enemy)) continue;
+                bullet.active = false;
+                enemy.active = false;
+                s.explosions.push({ x: enemy.x + enemy.width / 2, y: enemy.y + enemy.height / 2, frame: 0 });
+                setScore((prev) => prev + (enemy.type + 1) * 10);
+            }
+        }
+
+        s.bullets = s.bullets.filter((bullet) => bullet.active);
+        s.enemies = s.enemies.filter((enemy) => enemy.active);
+
+        const playerBox: Box = { x: p.x, y: p.y, width: playerSize, height: playerSize };
+        const hitPlayer = (box: Box) => {
+            if (s.gameOver || !overlaps(box, playerBox)) return;
+            s.gameOver = true;
+            s.explosions.push({
+                x: playerBox.x + playerSize / 2,
+                y: playerBox.y + playerSize / 2,
+                frame: 0,
             });
+            setGameOver(true);
+        };
+        for (const enemy of s.enemies) hitPlayer(enemy);
+        for (const bullet of s.enemyBullets) hitPlayer(bullet);
+    }, [gameSpeed, playerSize, enemySize]);
 
-            newState.enemies.forEach((enemy) => {
-                if (enemy.active && checkCollision(enemy, newState.player)) {
-                    newState.gameOver = true;
-                    newState.explosions.push({
-                        x: newState.player.x + newState.player.width / 2,
-                        y: newState.player.y + newState.player.height / 2,
-                        frame: 0,
-                        active: true,
-                    });
-                }
-            });
-
-            newState.enemyBullets.forEach((bullet) => {
-                if (bullet.active && checkCollision(bullet, newState.player)) {
-                    newState.gameOver = true;
-                    newState.explosions.push({
-                        x: newState.player.x + newState.player.width / 2,
-                        y: newState.player.y + newState.player.height / 2,
-                        frame: 0,
-                        active: true,
-                    });
-                }
-            });
-
-            newState.bullets = newState.bullets.filter((bullet) => bullet.active);
-            newState.enemyBullets = newState.enemyBullets.filter((bullet) => bullet.active);
-            newState.enemies = newState.enemies.filter((enemy) => enemy.active);
-
-            newState.explosions = newState.explosions.filter((explosion) => {
-                explosion.frame++;
-                return explosion.frame < 10;
-            });
-
-            return newState;
-        });
-    }, [gameSpeed, fireBullet, fireEnemyBullet, spawnEnemy, checkCollision]);
-
-    useEffect(() => {
-        setGameState((prevState) => ({
-            ...prevState,
-            player: { ...prevState.player, width: playerSize, height: playerSize },
-        }));
-    }, [playerSize]);
-
-    const render = useCallback(() => {
+    const draw = useCallback(() => {
         const canvas = canvasRef.current;
         if (!canvas) return;
         const ctx = canvas.getContext("2d");
         if (!ctx) return;
+        const s = stateRef.current;
 
         ctx.fillStyle = backgroundColor;
         ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
@@ -379,7 +327,7 @@ export default function SpaceShooter({
         ctx.globalAlpha = starOpacity;
         for (let i = 0; i < 50; i++) {
             const x = (i * 137 + Math.sin(i * 2.3) * 100) % CANVAS_WIDTH;
-            const y = (i * 197 + Math.cos(i * 1.7) * 150 + Date.now() * 0.1) % CANVAS_HEIGHT;
+            const y = (i * 197 + Math.cos(i * 1.7) * 150 + s.elapsed * 0.1) % CANVAS_HEIGHT;
             const starX = Math.floor(x / PIXEL_SIZE) * PIXEL_SIZE;
             const starY = Math.floor(y / PIXEL_SIZE) * PIXEL_SIZE;
             const size = starSize * PIXEL_SIZE;
@@ -388,15 +336,13 @@ export default function SpaceShooter({
         }
         ctx.globalAlpha = 1;
 
-        if (!gameState.gameOver) {
-            drawPlayer(ctx, gameState.player);
-        }
-        gameState.bullets.forEach((bullet) => drawBullet(ctx, bullet));
-        gameState.enemyBullets.forEach((bullet) => drawEnemyBullet(ctx, bullet));
-        gameState.enemies.forEach((enemy) => drawEnemy(ctx, enemy));
-        gameState.explosions.forEach((explosion) => drawExplosion(ctx, explosion));
+        if (!s.gameOver) drawPlayer(ctx, s.player);
+        for (const bullet of s.bullets) drawBullet(ctx, bullet);
+        for (const bullet of s.enemyBullets) drawEnemyBullet(ctx, bullet);
+        for (const enemy of s.enemies) drawEnemy(ctx, enemy);
+        for (const explosion of s.explosions) drawExplosion(ctx, explosion);
 
-        if (gameState.gameOver) {
+        if (s.gameOver) {
             ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
             ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
         }
@@ -405,9 +351,6 @@ export default function SpaceShooter({
         starColor,
         starSize,
         starOpacity,
-        gameState,
-        score,
-        scoreColor,
         drawPlayer,
         drawBullet,
         drawEnemyBullet,
@@ -415,109 +358,86 @@ export default function SpaceShooter({
         drawExplosion,
     ]);
 
-    const gameLoop = useCallback(() => {
-        updateGame();
-        render();
-        gameLoopRef.current = requestAnimationFrame(gameLoop);
-    }, [updateGame, render]);
+    const resetGame = useCallback(() => {
+        stateRef.current = createState();
+        clearKeys(keysRef.current);
+        setScore(0);
+        setGameOver(false);
+    }, []);
 
-    const handleKeyDown = useCallback(
-        (e: KeyboardEvent) => {
-            if ((ARROW_KEYS as readonly string[]).includes(e.key)) {
-                e.preventDefault();
-                keysRef.current.add(e.key as ArrowKey);
-            }
-            if (gameState.gameOver) {
-                e.preventDefault();
-                resetGame();
-            }
-        },
-        [gameState.gameOver, resetGame]
-    );
+    const handleKeyDown = useCallback((e: KeyboardEvent) => {
+        if ((ARROW_KEYS as readonly string[]).includes(e.key)) {
+            e.preventDefault();
+            keysRef.current.add(e.key);
+        }
+        if (stateRef.current.gameOver) {
+            e.preventDefault();
+            resetGame();
+        }
+    }, [resetGame]);
 
     const handleKeyUp = useCallback((e: KeyboardEvent) => {
         keysRef.current.delete(e.key);
     }, []);
 
-    const getDirectionFromTouch = (touchX: number, touchY: number, rect: DOMRect): ArrowKey => {
-        const centerX = rect.width / 2;
-        const centerY = rect.height / 2;
-        const isLeft = touchX < centerX;
-        const isUp = touchY < centerY;
-        const horizontalDistance = Math.abs(touchX - centerX);
-        const verticalDistance = Math.abs(touchY - centerY);
-        if (horizontalDistance > verticalDistance) {
-            return isLeft ? "ArrowLeft" : "ArrowRight";
+    const handleTouchStart = useCallback((e: React.TouchEvent<HTMLCanvasElement>) => {
+        e.preventDefault();
+        const rect = canvasRef.current?.getBoundingClientRect();
+        if (rect && e.touches[0]) {
+            const { clientX, clientY } = e.touches[0];
+            keysRef.current.add(getDirectionFromTouch(clientX - rect.left, clientY - rect.top, rect));
         }
-        return isUp ? "ArrowUp" : "ArrowDown";
-    };
-
-    const handleTouchStart = useCallback(
-        (e: React.TouchEvent<HTMLCanvasElement>) => {
-            e.preventDefault();
-            const rect = canvasRef.current?.getBoundingClientRect();
-            if (rect && e.touches[0]) {
-                const touchX = e.touches[0].clientX - rect.left;
-                const touchY = e.touches[0].clientY - rect.top;
-                keysRef.current.add(getDirectionFromTouch(touchX, touchY, rect));
-            }
-            if (gameState.gameOver) {
-                resetGame();
-            }
-        },
-        [gameState.gameOver, resetGame]
-    );
+        if (stateRef.current.gameOver) resetGame();
+    }, [resetGame]);
 
     const handleTouchMove = useCallback((e: React.TouchEvent<HTMLCanvasElement>) => {
         e.preventDefault();
-        keysRef.current.delete("ArrowLeft");
-        keysRef.current.delete("ArrowRight");
-        keysRef.current.delete("ArrowUp");
-        keysRef.current.delete("ArrowDown");
+        clearKeys(keysRef.current);
         const rect = canvasRef.current?.getBoundingClientRect();
         if (rect && e.touches[0]) {
-            const touchX = e.touches[0].clientX - rect.left;
-            const touchY = e.touches[0].clientY - rect.top;
-            keysRef.current.add(getDirectionFromTouch(touchX, touchY, rect));
+            const { clientX, clientY } = e.touches[0];
+            keysRef.current.add(getDirectionFromTouch(clientX - rect.left, clientY - rect.top, rect));
         }
     }, []);
 
     const handleTouchEnd = useCallback((e: React.TouchEvent<HTMLCanvasElement>) => {
         e.preventDefault();
-        keysRef.current.delete("ArrowLeft");
-        keysRef.current.delete("ArrowRight");
-        keysRef.current.delete("ArrowUp");
-        keysRef.current.delete("ArrowDown");
+        clearKeys(keysRef.current);
     }, []);
 
     const handleCanvasClick = useCallback(() => {
-        if (gameState.gameOver) {
-            resetGame();
-        }
-    }, [gameState.gameOver, resetGame]);
+        if (stateRef.current.gameOver) resetGame();
+    }, [resetGame]);
 
     useEffect(() => {
-        let isVisible = true;
+        let raf = 0;
+        let last = performance.now();
+        let running = false;
+        let onScreen = true;
 
-        const startLoop = () => {
-            if (gameLoopRef.current === null) {
-                gameLoopRef.current = requestAnimationFrame(gameLoop);
-            }
+        function step(now: number) {
+            const dt = Math.min(2, (now - last) / FRAME_MS);
+            last = now;
+            update(dt);
+            draw();
+            raf = requestAnimationFrame(step);
+        }
+
+        const start = () => {
+            if (running) return;
+            running = true;
+            last = performance.now();
+            raf = requestAnimationFrame(step);
         };
 
-        const stopLoop = () => {
-            if (gameLoopRef.current !== null) {
-                cancelAnimationFrame(gameLoopRef.current);
-                gameLoopRef.current = null;
-            }
+        const stop = () => {
+            running = false;
+            cancelAnimationFrame(raf);
         };
 
         const handleVisibilityChange = () => {
-            if (document.hidden) {
-                stopLoop();
-            } else if (isVisible) {
-                startLoop();
-            }
+            if (document.hidden) stop();
+            else if (onScreen) start();
         };
 
         const canvas = canvasRef.current;
@@ -525,12 +445,9 @@ export default function SpaceShooter({
         if (canvas && "IntersectionObserver" in window) {
             observer = new IntersectionObserver(
                 ([entry]) => {
-                    isVisible = entry.isIntersecting;
-                    if (isVisible && !document.hidden) {
-                        startLoop();
-                    } else {
-                        stopLoop();
-                    }
+                    onScreen = entry.isIntersecting;
+                    if (onScreen && !document.hidden) start();
+                    else stop();
                 },
                 { threshold: 0 }
             );
@@ -540,61 +457,69 @@ export default function SpaceShooter({
         window.addEventListener("keydown", handleKeyDown);
         window.addEventListener("keyup", handleKeyUp);
         document.addEventListener("visibilitychange", handleVisibilityChange);
-
-        startLoop();
+        start();
 
         return () => {
             window.removeEventListener("keydown", handleKeyDown);
             window.removeEventListener("keyup", handleKeyUp);
             document.removeEventListener("visibilitychange", handleVisibilityChange);
-            if (observer) observer.disconnect();
-            stopLoop();
+            observer?.disconnect();
+            stop();
         };
-    }, [gameLoop, handleKeyDown, handleKeyUp]);
+    }, [update, draw, handleKeyDown, handleKeyUp]);
 
     return (
         <div
             className={cn(
-                "relative w-full aspect-[4/3] overflow-hidden rounded-lg select-none",
+                "flex h-dvh w-screen select-none items-center justify-center overflow-hidden bg-black",
                 className
             )}
-            style={{ backgroundColor }}
         >
-            <canvas
-                ref={canvasRef}
-                width={CANVAS_WIDTH}
-                height={CANVAS_HEIGHT}
-                className="block h-full w-full [image-rendering:pixelated]"
-                onTouchStart={handleTouchStart}
-                onTouchMove={handleTouchMove}
-                onTouchEnd={handleTouchEnd}
-                onClick={handleCanvasClick}
-            />
-            <div
-                className="pointer-events-none absolute left-4 top-4 text-xl font-bold sm:text-2xl"
-                style={{ color: scoreColor, ...font }}
-            >
-                SCORE: {score}
-            </div>
-            <div
-                className="pointer-events-none absolute bottom-4 left-4 text-[10px] sm:text-xs"
-                style={{ color: scoreColor, ...font }}
-            >
-                Arrow Keys / Touch to Move
-            </div>
-            {gameState.gameOver && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-background/10">
-                    <p className="text-2xl font-bold" style={{ color: scoreColor, ...font }}>
-                        Game over
-                    </p>
-                    <p className="text-sm" style={{ color: scoreColor, ...font }}>
-                        Skor akhir: {score}
-                    </p>
-                    <Button onClick={resetGame} size="lg">
-                        Main lagi
-                    </Button>
+            <div className="relative h-[min(100dvh,calc(100vw*3/4))] aspect-[4/3]">
+                <canvas
+                    ref={canvasRef}
+                    width={CANVAS_WIDTH}
+                    height={CANVAS_HEIGHT}
+                    className="block h-full w-full [image-rendering:pixelated]"
+                    onTouchStart={handleTouchStart}
+                    onTouchMove={handleTouchMove}
+                    onTouchEnd={handleTouchEnd}
+                    onClick={handleCanvasClick}
+                />
+                <div
+                    className="pointer-events-none absolute left-4 top-4 text-xl font-bold sm:text-2xl"
+                    style={{ color: scoreColor, ...font }}
+                >
+                    SCORE: {score}
                 </div>
-            )}
+                <div
+                    className="pointer-events-none absolute bottom-4 left-4 text-[10px] sm:text-xs"
+                    style={{ color: scoreColor, ...font }}
+                >
+                    Arrow Keys / Touch to Move
+                </div>
+                {gameOver && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-background/10">
+                        <p className="text-2xl font-bold" style={{ color: scoreColor, ...font }}>
+                            Game over
+                        </p>
+                        <p className="text-sm" style={{ color: scoreColor, ...font }}>
+                            Skor akhir: {score}
+                        </p>
+                        <Button onClick={resetGame} size="lg">
+                            Main lagi
+                        </Button>
+                    </div>
+                )}
+            </div>
+            {/* The nav is gone on this page, so this is the only way off a 404. */}
+            <Link
+                href="/"
+                className="absolute right-4 top-4 rounded-md border border-white/20 px-3 py-1.5 text-sm font-medium text-white/80 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60"
+                style={font}
+            >
+                ← Home
+            </Link>
         </div>
     );
 }
